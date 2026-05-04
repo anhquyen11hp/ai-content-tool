@@ -29,3 +29,4 @@ __pycache__/
 .venv/
 .env
 src-python/temp/
+*.mp3
