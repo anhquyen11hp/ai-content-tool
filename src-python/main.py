@@ -1,14 +1,21 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Literal, Optional
+from typing import Literal
 
-app = FastAPI(title="AI Content & Scraping Tool API", version="2.5.0")
+import services.tiktok_service as tiktok_service
+import services.ai_service as ai_service
 
-# Allow requests from the Vite dev server (localhost:1420 is Tauri default)
+app = FastAPI(title="AI Content & Scraping Tool API", version="3.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:1420", "http://127.0.0.1:1420", "http://localhost:5173", "tauri://localhost"],
+    allow_origins=[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "http://localhost:5173",
+        "tauri://localhost",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,62 +29,58 @@ class AnalyzeRequest(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "AI Content & Scraping Tool API is running 🚀 (v2.5)"}
-
-
-import services.tiktok_service as tiktok_service
+    return {"message": "AI Content & Scraping Tool API is running 🚀 (v3.0)"}
 
 
 def _is_channel_url(url: str) -> bool:
     """
-    Phân biệt link kênh vs link video.
-    Link video TikTok chứa /video/ trong đường dẫn.
-    Link kênh TikTok chứa @ nhưng KHÔNG có /video/.
+    Phân biệt link kênh vs link video đơn lẻ.
     """
-    has_video_path = "/video/" in url
-    has_profile = "@" in url
-    # YouTube channel: /channel/ hoặc /@username nhưng không có /watch?
-    is_youtube_watch = "watch?v=" in url or "/shorts/" in url
-    if is_youtube_watch:
+    if "watch?v=" in url or "/shorts/" in url:
         return False
-    if has_video_path:
+    if "/video/" in url:
         return False
-    if has_profile:
+    if "@" in url:
         return True
     return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT CHÍNH
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/api/analyze")
 def analyze(body: AnalyzeRequest):
     """
-    Phase 2.5 — Dual-Mode Analyze.
-    - Link Video  → Chế độ Bán Hàng  (download + Whisper)
-    - Link Kênh   → Chế độ Xây Kênh  (get top-3 videos + Whisper x3 + GPT analysis)
+    Phase 3 — Full AI Pipeline (Dual-Mode).
+
+    CHẾ ĐỘ XÂY KÊNH  (Creator / Link Kênh):
+        1. Lấy 30 video mới nhất từ kênh → Sort top 3 theo view
+        2. Tải audio + Whisper x3 → Gộp transcripts
+        3. GPT phân tích → hook_analysis, content_structure, new_hook_ideas, pain_points
+
+    CHẾ ĐỘ BÁN HÀNG (E-Com / Link Video):
+        1. Tải audio 1 video → Whisper
+        2. GPT phân tích → selling_points, customer_pain_points_addressed,
+                           sales_script_ideas, hook_ideas
     """
     url = body.url.strip()
+    mode = body.mode
 
-    # ─── TRƯỜNG HỢP 2: Link Kênh – Chế độ Xây Kênh ─────────────────────────
+    # ── TRƯỜNG HỢP 1: Link Kênh – Chế độ Xây Kênh ──────────────────────────
     if _is_channel_url(url):
-        # Bước 2a: Lấy danh sách 30 video, chọn Top 3 nhiều view nhất
-        channel_result = tiktok_service.get_channel_videos(url, max_videos=30)
 
+        # Bước 1: Lấy danh sách video
+        channel_result = tiktok_service.get_channel_videos(url, max_videos=30)
         if channel_result.get("status") == "error":
-            return {
-                "status": "error",
-                "message": f"Lỗi quét kênh: {channel_result.get('message')}"
-            }
+            return {"status": "error", "message": f"Lỗi quét kênh: {channel_result.get('message')}"}
 
         videos = channel_result.get("videos", [])
         if not videos:
-            return {
-                "status": "error",
-                "message": "Không tìm thấy video nào trên kênh này."
-            }
+            return {"status": "error", "message": "Không tìm thấy video nào trên kênh này."}
 
-        # Lấy top 3 (đã được sort giảm dần theo view trong service)
+        # Bước 2: Bóc băng Top 3
         top_videos = videos[:3]
-
-        # Bước 2b: Vòng lặp bóc băng Top 3 video
         transcripts = []
         video_details = []
 
@@ -86,10 +89,8 @@ def analyze(body: AnalyzeRequest):
             if not video_url:
                 continue
 
-            # Tải audio
             dl_result = tiktok_service.download_tiktok_audio(video_url)
             if dl_result.get("status") == "error":
-                # Bỏ qua video lỗi, không dừng toàn bộ pipeline
                 video_details.append({
                     "url": video_url,
                     "title": video.get("title", ""),
@@ -98,7 +99,6 @@ def analyze(body: AnalyzeRequest):
                 })
                 continue
 
-            # Bóc băng Whisper
             ts_result = tiktok_service.transcribe_audio(dl_result["file_path"])
             transcript_text = (
                 ts_result.get("transcript", "")
@@ -114,67 +114,57 @@ def analyze(body: AnalyzeRequest):
                 "transcript": transcript_text
             })
 
-        # Bước 2c: Gộp transcript và phân tích bằng GPT
-        combined_transcripts = "\n\n---\n\n".join(
-            [f"VIDEO {i+1} ({vd['view_count']:,} views) - {vd['title']}:\n{vd['transcript']}"
-             for i, vd in enumerate(video_details)]
-        )
+        # Bước 3: GPT phân tích (mode = "creator")
+        ai_result = ai_service.analyze_content(transcripts, mode="creator")
+        if ai_result.get("status") == "error":
+            return {"status": "error", "message": f"Lỗi phân tích AI: {ai_result.get('message')}"}
 
-        gpt_result = tiktok_service.analyze_channel_prompt(combined_transcripts)
+        data = ai_result.get("data", {})
 
-        if gpt_result.get("status") == "error":
-            return {
-                "status": "error",
-                "message": f"Lỗi phân tích GPT: {gpt_result.get('message')}"
-            }
-
-        # Bước 2d: Trả kết quả cho Frontend
         return {
             "status": "success",
             "mode": "creator",
             "analyzed_url": url,
-            "channel_mode": True,
             "total_scanned": len(videos),
             "video_details": video_details,
-            "hook_ideas": gpt_result.get("hook_ideas", []),
-            "pain_points": gpt_result.get("pain_points", []),
+            # Creator-specific fields
+            "hook_analysis": data.get("hook_analysis", ""),
+            "content_structure": data.get("content_structure", ""),
+            "new_hook_ideas": data.get("new_hook_ideas", []),
+            "pain_points": data.get("pain_points", []),
         }
 
-    # ─── TRƯỜNG HỢP 1: Link Video – Chế độ Bán Hàng ────────────────────────
+    # ── TRƯỜNG HỢP 2: Link Video – Chế độ Bán Hàng ─────────────────────────
     else:
-        # 1. Download audio và lấy metadata
+        # Bước 1: Tải audio
         dl_result = tiktok_service.download_tiktok_audio(url)
-
         if dl_result.get("status") == "error":
-            return {
-                "status": "error",
-                "message": f"Lỗi tải video: {dl_result.get('message')}"
-            }
+            return {"status": "error", "message": f"Lỗi tải video: {dl_result.get('message')}"}
 
-        file_path = dl_result["file_path"]
-        title = dl_result.get("title", "")
-        view_count = dl_result.get("view_count", 0)
-
-        # 2. Bóc băng Whisper
-        ts_result = tiktok_service.transcribe_audio(file_path)
-
+        # Bước 2: Bóc băng Whisper
+        ts_result = tiktok_service.transcribe_audio(dl_result["file_path"])
         if ts_result.get("status") == "error":
-            return {
-                "status": "error",
-                "message": f"Lỗi bóc băng: {ts_result.get('message')}"
-            }
+            return {"status": "error", "message": f"Lỗi bóc băng: {ts_result.get('message')}"}
 
         transcript = ts_result.get("transcript", "")
+
+        # Bước 3: GPT phân tích (mode = "ecom")
+        ai_result = ai_service.analyze_content([transcript], mode="ecom")
+        if ai_result.get("status") == "error":
+            return {"status": "error", "message": f"Lỗi phân tích AI: {ai_result.get('message')}"}
+
+        data = ai_result.get("data", {})
 
         return {
             "status": "success",
             "mode": "ecom",
             "analyzed_url": url,
-            "channel_mode": False,
-            "title": title,
-            "view_count": view_count,
+            "title": dl_result.get("title", ""),
+            "view_count": dl_result.get("view_count", 0),
             "transcript": transcript,
-            # Placeholder cho Phase 3 (AI content generation)
-            "hook_ideas": ["(Sẽ có ở Giai đoạn 3)"],
-            "pain_points": ["(Sẽ có ở Giai đoạn 3)"]
+            # E-com specific fields
+            "selling_points": data.get("selling_points", []),
+            "customer_pain_points_addressed": data.get("customer_pain_points_addressed", []),
+            "sales_script_ideas": data.get("sales_script_ideas", []),
+            "hook_ideas": data.get("hook_ideas", []),
         }
