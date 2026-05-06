@@ -30,3 +30,5 @@ __pycache__/
 .env
 src-python/temp/
 *.mp3
+
+rustup-init.exe
